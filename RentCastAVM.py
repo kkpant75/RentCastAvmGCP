@@ -1,494 +1,424 @@
-#!/usr/bin/env python3
-"""
-RentCast API to CSV Converter
-Fetches property valuation data and converts to CSV format
-"""
-
-import argparse
-import requests
-import csv
-import json
 import os
-from datetime import datetime
+import sys
+import json
+import requests
+import logging
 from urllib.parse import quote
+from datetime import datetime, timedelta
+from google.cloud import storage
+from io import StringIO
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
 load_dotenv()
 
-def fetch_rentcast_data1(api_key=None, address=None, comp_count=5):
+class RentCastAVMProcessor:
+    def __init__(self, api_key, comp_count=5):
+        """
+        Initialize the RentCast AVM Processor
+        
+        Args:
+            api_key: RentCast API key
+            comp_count: Number of comparables (default: 5)
+        """
+        self.api_key = api_key
+        self.comp_count = comp_count
+        self.bucket_name = "rent-cast-avm"
+        self.base_folder="AVM"
+        self.input_file = F"{self.base_folder}/avmfile.txt"
+        self.processed_file = f"{self.base_folder}/processed/avmfile.txt"
+        self.output_folder = "JSON"
+        self.log_folder = "Logs"
+        
+        # Setup logging
+        self.setup_logging()
+        
+    def setup_logging(self):
+        """Setup logging configuration with StringIO buffer and console handlers"""
+        # Create logger
+        self.logger = logging.getLogger('RentCastAVMProcessor')
+        self.logger.setLevel(logging.INFO)
+        
+        # Clear existing handlers
+        self.logger.handlers = []
+        
+        # Create formatter
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        
+        # Console handler
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(formatter)
+        self.logger.addHandler(console_handler)
+        
+        # StringIO buffer for log storage
+        self.log_buffer = StringIO()
+        buffer_handler = logging.StreamHandler(self.log_buffer)
+        buffer_handler.setLevel(logging.INFO)
+        buffer_handler.setFormatter(formatter)
+        self.logger.addHandler(buffer_handler)
+        
+        self.logger.info("Logging initialized")
+    
+    def upload_log_to_gcp(self):
+        """Upload log from StringIO buffer to GCP bucket"""
+        try:
+            # Generate log filename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_filename = f"rentcast_avm_{timestamp}.log"
+            log_path = f"{self.log_folder}/{log_filename}"
+            
+            # Get log content from buffer
+            log_content = self.log_buffer.getvalue()
+            
+            # Upload to GCP
+            storage_client = storage.Client()
+            bucket = storage_client.bucket(self.bucket_name)
+            blob = bucket.blob(log_path)
+            blob.upload_from_string(log_content, content_type='text/plain')
+            
+            self.logger.info(f"Log file uploaded to GCP: {log_path}")
+            
+            # Close the buffer
+            self.log_buffer.close()
+                
+        except Exception as e:
+            self.logger.error(f"Error uploading log to GCP: {e}")
+    
+    def cleanup_old_logs(self, days=7):
+        """
+        Delete log files older than specified days
+        
+        Args:
+            days: Number of days to retain logs (default: 7)
+        """
+        try:
+            storage_client = storage.Client()
+            bucket = storage_client.bucket(self.bucket_name)
+            
+            cutoff_date = datetime.now() - timedelta(days=days)
+            deleted_count = 0
+            
+            self.logger.info(f"Cleaning up log files older than {days} days...")
+            
+            # List all blobs in the Logs folder
+            blobs = bucket.list_blobs(prefix=f"{self.log_folder}/")
+            
+            for blob in blobs:
+                # Get blob creation time
+                if blob.time_created:
+                    # Convert to offset-naive datetime for comparison
+                    blob_date = blob.time_created.replace(tzinfo=None)
+                    
+                    if blob_date < cutoff_date:
+                        self.logger.info(f"Deleting old log file: {blob.name}")
+                        blob.delete()
+                        deleted_count += 1
+            
+            self.logger.info(f"Deleted {deleted_count} old log file(s)")
+            
+        except Exception as e:
+            self.logger.error(f"Error cleaning up old logs: {e}")
+    
+    def cleanup_old_processed_files(self, days=100):
+        """
+        Delete processed files older than specified days
+        
+        Args:
+            days: Number of days to retain processed files (default: 100)
+        """
+        try:
+            storage_client = storage.Client()
+            bucket = storage_client.bucket(self.bucket_name)
+            
+            cutoff_date = datetime.now() - timedelta(days=days)
+            deleted_count = 0
+            
+            self.logger.info(f"Cleaning up processed files older than {days} days...")
+            
+            # List all blobs in the Input/processed folder
+            blobs = bucket.list_blobs(prefix=f"{self.base_folder}/processed/")
+            
+            for blob in blobs:
+                # Get blob creation time
+                if blob.time_created:
+                    # Convert to offset-naive datetime for comparison
+                    blob_date = blob.time_created.replace(tzinfo=None)
+                    
+                    if blob_date < cutoff_date:
+                        self.logger.info(f"Deleting old processed file: {blob.name}")
+                        blob.delete()
+                        deleted_count += 1
+            
+            self.logger.info(f"Deleted {deleted_count} old processed file(s)")
+            
+        except Exception as e:
+            self.logger.error(f"Error cleaning up old processed files: {e}")
+    
+    def read_addresses_from_gcp(self):
+        """Read addresses from GCP bucket"""
+        try:
+            self.logger.info(f"Reading addresses from {self.bucket_name}/{self.input_file}")
+            
+            storage_client = storage.Client()
+            bucket = storage_client.bucket(self.bucket_name)
+            blob = bucket.blob(self.input_file)
+            
+            # Download file content
+            content = blob.download_as_text()
+            addresses = [line.strip() for line in content.split('\n') if line.strip()]
+            
+            self.logger.info(f"Successfully read {len(addresses)} addresses from GCP")
+            return addresses
+            
+        except Exception as e:
+            self.logger.error(f"Error reading from GCP: {e}")
+            return []
+    
+    def call_rentcast_api(self, address):
+        """
+        Call RentCast API for a single address
+        
+        Args:
+            address: The address to query
+            
+        Returns:
+            dict: API response data or error information
+        """
+        try:
+            encoded_address = quote(address)
+            url = f"https://api.rentcast.io/v1/avm/value?address={encoded_address}&compCount={self.comp_count}"
+            
+            headers = {
+                "X-Api-Key": self.api_key,
+                "Accept": "application/json"
+            }
+            
+            self.logger.debug(f"Calling API for address: {address}")
+            response = requests.get(url, headers=headers, timeout=30)
+            
+            if response.status_code == 200:
+                self.logger.info(f"SUCCESS: {address}")
+                return {
+                    "address": address,
+                    "status": "success",
+                    "data": response.json()
+                }
+            else:
+                self.logger.warning(f"ERROR: API Error for {address}: Status {response.status_code}")
+                return {
+                    "address": address,
+                    "status": "error",
+                    "error_code": response.status_code,
+                    "error_message": response.text
+                }
+                
+        except Exception as e:
+            self.logger.error(f"EXCEPTION for {address}: {str(e)}")
+            return {
+                "address": address,
+                "status": "error",
+                "error_message": str(e)
+            }
+    
+    def process_batch(self, addresses):
+        """
+        Process a batch of addresses
+        
+        Args:
+            addresses: List of addresses to process
+            
+        Returns:
+            list: Results for all addresses in the batch
+        """
+        results = []
+        success_count = 0
+        error_count = 0
+        
+        for idx, address in enumerate(addresses, 1):
+            self.logger.info(f"Processing address {idx}/{len(addresses)}: {address}")
+            result = self.call_rentcast_api(address)
+            results.append(result)
+            
+            if result['status'] == 'success':
+                success_count += 1
+            else:
+                error_count += 1
+        
+        self.logger.info(f"Batch complete - Success: {success_count}, Errors: {error_count}")
+        return results
+    
+    def save_batch_to_gcp(self, batch_results, batch_number):
+        """
+        Save batch results to GCP as JSON
+        
+        Args:
+            batch_results: List of results for the batch
+            batch_number: Batch number for file naming
+        """
+        try:
+            # Generate filename with current date
+            date_str = datetime.now().strftime("%y%m%d")
+            filename = f"rentcast_avm_{date_str}_{batch_number:03d}.json"
+            filepath = f"{self.output_folder}/{filename}"
+            
+            # Convert to JSON
+            json_content = json.dumps(batch_results, indent=2)
+            
+            # Upload to GCP
+            storage_client = storage.Client()
+            bucket = storage_client.bucket(self.bucket_name)
+            blob = bucket.blob(filepath)
+            blob.upload_from_string(json_content, content_type='application/json')
+            
+            self.logger.info(f"Successfully saved {filename} to GCP ({len(batch_results)} records)")
+            
+        except Exception as e:
+            self.logger.error(f"Error saving batch to GCP: {e}")
+    
+    def move_input_file_to_processed(self):
+        """Move the input file to processed folder in GCP"""
+        try:
+            self.logger.info(f"Moving {self.input_file} to processed folder...")
+            
+            storage_client = storage.Client()
+            bucket = storage_client.bucket(self.bucket_name)
+            
+            # Generate timestamped filename for processed file
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            processed_filename = f"{self.base_folder}/processed/avmfile_{timestamp}.txt"
+            
+            # Get source blob
+            source_blob = bucket.blob(self.input_file)
+            
+            # Copy to processed folder with timestamp
+            bucket.copy_blob(source_blob, bucket, processed_filename)
+            
+            # Delete original
+            source_blob.delete()
+            
+            self.logger.info(f"Successfully moved {self.input_file} to {processed_filename}")
+            
+        except Exception as e:
+            self.logger.error(f"Error moving file: {e}")
+    
+    def process_all_addresses(self):
+        """Main processing function"""
+        try:
+            self.logger.info("="*70)
+            self.logger.info("Starting RentCast AVM processing...")
+            self.logger.info("="*70)
+            
+            # Cleanup old files first
+            self.cleanup_old_logs(days=7)
+            self.cleanup_old_processed_files(days=100)
+            
+            # Read addresses from GCP
+            addresses = self.read_addresses_from_gcp()
+            
+            if not addresses:
+                self.logger.warning("No addresses found to process")
+                return
+            
+            # Process in batches of 100
+            batch_size = 100
+            total_batches = (len(addresses) + batch_size - 1) // batch_size
+            
+            self.logger.info(f"Total addresses: {len(addresses)}")
+            self.logger.info(f"Batch size: {batch_size}")
+            self.logger.info(f"Total batches: {total_batches}")
+            self.logger.info("-"*70)
+            
+            overall_success = 0
+            overall_errors = 0
+            
+            for batch_num in range(total_batches):
+                start_idx = batch_num * batch_size
+                end_idx = min(start_idx + batch_size, len(addresses))
+                batch_addresses = addresses[start_idx:end_idx]
+                
+                self.logger.info(f"\n{'='*70}")
+                self.logger.info(f"Processing Batch {batch_num + 1}/{total_batches}")
+                self.logger.info(f"Addresses: {start_idx + 1} to {end_idx}")
+                self.logger.info(f"{'='*70}")
+                
+                # Process the batch
+                batch_results = self.process_batch(batch_addresses)
+                
+                # Count successes and errors
+                batch_success = sum(1 for r in batch_results if r['status'] == 'success')
+                batch_errors = sum(1 for r in batch_results if r['status'] == 'error')
+                
+                overall_success += batch_success
+                overall_errors += batch_errors
+                
+                # Save results to GCP
+                self.save_batch_to_gcp(batch_results, batch_num + 1)
+            
+            # Move input file to processed folder
+            self.logger.info("\n" + "="*70)
+            self.logger.info("Moving input file to processed folder...")
+            self.move_input_file_to_processed()
+            
+            # Final summary
+            self.logger.info("\n" + "="*70)
+            self.logger.info("PROCESSING COMPLETE")
+            self.logger.info("="*70)
+            self.logger.info(f"Total addresses processed: {len(addresses)}")
+            self.logger.info(f"Successful: {overall_success}")
+            self.logger.info(f"Errors: {overall_errors}")
+            self.logger.info(f"Success rate: {(overall_success/len(addresses)*100):.2f}%")
+            self.logger.info("="*70)
+            
+        except Exception as e:
+            self.logger.error(f"Critical error in main processing: {e}", exc_info=True)
+            
+        finally:
+            # Upload log to GCP
+            self.upload_log_to_gcp()
 
-	jsonstr="""{
-	  "price": 250000,
-	  "priceRangeLow": 195000,
-	  "priceRangeHigh": 304000,
-	  "subjectProperty": {
-		"id": "5500-Grand-Lake-Dr,-San-Antonio,-TX-78244",
-		"formattedAddress": "5500 Grand Lake Dr, San Antonio, TX 78244",
-		"addressLine1": "5500 Grand Lake Dr",
-		"addressLine2": null,
-		"city": "San Antonio",
-		"state": "TX",
-		"stateFips": "48",
-		"zipCode": "78244",
-		"county": "Bexar",
-		"countyFips": "029",
-		"latitude": 29.476011,
-		"longitude": -98.351454,
-		"propertyType": "Single Family",
-		"bedrooms": 3,
-		"bathrooms": 2,
-		"squareFootage": 1878,
-		"lotSize": 8843,
-		"yearBuilt": 1973,
-		"lastSaleDate": "2024-11-18T00:00:00.000Z",
-		"lastSalePrice": 270000
-	  },
-	  "comparables": [
-		{
-		  "id": "5207-Pine-Lake-Dr,-San-Antonio,-TX-78244",
-		  "formattedAddress": "5207 Pine Lake Dr, San Antonio, TX 78244",
-		  "addressLine1": "5207 Pine Lake Dr",
-		  "addressLine2": null,
-		  "city": "San Antonio",
-		  "state": "TX",
-		  "stateFips": "48",
-		  "zipCode": "78244",
-		  "county": "Bexar",
-		  "countyFips": "029",
-		  "latitude": 29.47046,
-		  "longitude": -98.351561,
-		  "propertyType": "Single Family",
-		  "bedrooms": 3,
-		  "bathrooms": 2,
-		  "squareFootage": 1895,
-		  "lotSize": 6882,
-		  "yearBuilt": 1988,
-		  "status": "Active",
-		  "price": 289444,
-		  "listingType": "Standard",
-		  "listedDate": "2025-04-11T00:00:00.000Z",
-		  "removedDate": null,
-		  "lastSeenDate": "2025-09-03T10:57:39.532Z",
-		  "daysOnMarket": 146,
-		  "distance": 0.384,
-		  "daysOld": 1,
-		  "correlation": 0.9916
-		},
-		{
-		  "id": "6707-Lake-Cliff-St,-San-Antonio,-TX-78244",
-		  "formattedAddress": "6707 Lake Cliff St, San Antonio, TX 78244",
-		  "addressLine1": "6707 Lake Cliff St",
-		  "addressLine2": null,
-		  "city": "San Antonio",
-		  "state": "TX",
-		  "stateFips": "48",
-		  "zipCode": "78244",
-		  "county": "Bexar",
-		  "countyFips": "029",
-		  "latitude": 29.47617,
-		  "longitude": -98.356908,
-		  "propertyType": "Single Family",
-		  "bedrooms": 3,
-		  "bathrooms": 2,
-		  "squareFootage": 1811,
-		  "lotSize": 8146,
-		  "yearBuilt": 1977,
-		  "status": "Inactive",
-		  "price": 279000,
-		  "listingType": "Standard",
-		  "listedDate": "2025-06-06T00:00:00.000Z",
-		  "removedDate": "2025-07-12T00:00:00.000Z",
-		  "lastSeenDate": "2025-07-11T13:21:20.968Z",
-		  "daysOnMarket": 36,
-		  "distance": 0.3286,
-		  "daysOld": 55,
-		  "correlation": 0.9887
-		},
-		{
-		  "id": "6917-Deep-Lake-Dr,-San-Antonio,-TX-78244",
-		  "formattedAddress": "6917 Deep Lake Dr, San Antonio, TX 78244",
-		  "addressLine1": "6917 Deep Lake Dr",
-		  "addressLine2": null,
-		  "city": "San Antonio",
-		  "state": "TX",
-		  "stateFips": "48",
-		  "zipCode": "78244",
-		  "county": "Bexar",
-		  "countyFips": "029",
-		  "latitude": 29.479375,
-		  "longitude": -98.351978,
-		  "propertyType": "Single Family",
-		  "bedrooms": 3,
-		  "bathrooms": 2,
-		  "squareFootage": 1753,
-		  "lotSize": 11151,
-		  "yearBuilt": 1974,
-		  "status": "Inactive",
-		  "price": 199900,
-		  "listingType": "Standard",
-		  "listedDate": "2025-05-22T00:00:00.000Z",
-		  "removedDate": "2025-08-27T00:00:00.000Z",
-		  "lastSeenDate": "2025-08-26T12:36:31.859Z",
-		  "daysOnMarket": 97,
-		  "distance": 0.2348,
-		  "daysOld": 9,
-		  "correlation": 0.9863
-		},
-		{
-		  "id": "5314-Lost-Tree,-San-Antonio,-TX-78244",
-		  "formattedAddress": "5314 Lost Tree, San Antonio, TX 78244",
-		  "addressLine1": "5314 Lost Tree",
-		  "addressLine2": null,
-		  "city": "San Antonio",
-		  "state": "TX",
-		  "stateFips": "48",
-		  "zipCode": "78244",
-		  "county": "Bexar",
-		  "countyFips": "029",
-		  "latitude": 29.477064,
-		  "longitude": -98.343686,
-		  "propertyType": "Single Family",
-		  "bedrooms": 3,
-		  "bathrooms": 2,
-		  "squareFootage": 1948,
-		  "lotSize": 9017,
-		  "yearBuilt": 2000,
-		  "status": "Inactive",
-		  "price": 159900,
-		  "listingType": "Standard",
-		  "listedDate": "2025-06-23T00:00:00.000Z",
-		  "removedDate": "2025-06-28T00:00:00.000Z",
-		  "lastSeenDate": "2025-06-27T11:02:28.080Z",
-		  "daysOnMarket": 5,
-		  "distance": 0.4734,
-		  "daysOld": 69,
-		  "correlation": 0.9859
-		},
-		{
-		  "id": "7207-Solar-Eclipse,-Converse,-TX-78109",
-		  "formattedAddress": "7207 Solar Eclipse, Converse, TX 78109",
-		  "addressLine1": "7207 Solar Eclipse",
-		  "addressLine2": null,
-		  "city": "Converse",
-		  "state": "TX",
-		  "stateFips": "48",
-		  "zipCode": "78109",
-		  "county": "Bexar",
-		  "countyFips": "029",
-		  "latitude": 29.463689,
-		  "longitude": -98.348663,
-		  "propertyType": "Single Family",
-		  "bedrooms": 3,
-		  "bathrooms": 2,
-		  "squareFootage": 1883,
-		  "lotSize": 5140,
-		  "yearBuilt": 2022,
-		  "status": "Active",
-		  "price": 320000,
-		  "listingType": "Standard",
-		  "listedDate": "2025-03-10T00:00:00.000Z",
-		  "removedDate": null,
-		  "lastSeenDate": "2025-09-03T10:33:44.607Z",
-		  "daysOnMarket": 178,
-		  "distance": 0.8687,
-		  "daysOld": 1,
-		  "correlation": 0.9835
-		}
-	  ]
-	}"""
-	return json.loads(jsonstr)
+###################Google Secret Code Section######################################################
+from google.cloud import secretmanager
+import google_crc32c
 
+def access_secret_version(project_id: str, secret_id: str, version_id: str) -> secretmanager.AccessSecretVersionResponse:  
+    client = secretmanager.SecretManagerServiceClient()
 
+    name = f"projects/{project_id}/secrets/{secret_id}/versions/{version_id}"
 
-def fetch_rentcast_data(api_key, address, comp_count=5):
-    """
-    Fetch data from RentCast API
+    # Access the secret version.
+    response = client.access_secret_version(request={"name": name})
+
+    # Verify payload checksum.
+    crc32c = google_crc32c.Checksum()
+    crc32c.update(response.payload.data)
     
-    Args:
-        api_key (str): RentCast API key
-        address (str): Property address
-        comp_count (int): Number of comparable properties
+    if response.payload.data_crc32c != int(crc32c.hexdigest(), 16):
+        print("Data corruption detected.")
+        return response
+
+    payload = response.payload.data.decode("UTF-8")
     
-    Returns:
-        dict: JSON response from API
-    """
-    encoded_address = quote(address)
-    url = f"https://api.rentcast.io/v1/avm/value?address={encoded_address}&compCount={comp_count}"
-    
-    headers = {
-        'accept': 'application/json',
-        'X-Api-Key': api_key
-    }
-    
-    print(f"Fetching data for: {address}")
-    print(f"Requesting {comp_count} comparables...")
-    
+    return payload
+###################Google Secret Code Section Ends Here######################################################
+
+def GetRentCastAPIKeyFromSecrets():
     try:
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        print("✓ Data fetched successfully\n")
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        print(f"✗ Error fetching data: {e}")
-        return None
 
-
-def write_to_csv(data, output_file):
-    """
-    Convert JSON data to CSV format and write to file
-    Each row contains subject property data + one comparable property
-    
-    Args:
-        data (dict): JSON data from RentCast API
-        output_file (str): Output CSV filename
-    """
-    if not data:
-        print("No data to write")
-        return
-    
-    with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
-        writer = csv.writer(csvfile)
+        return access_secret_version(os.getenv('SECRET_PROJECT_ID'),os.getenv('SECRET_KEY_RENTCAST'),'latest')
+    except Exception as e:
+        print("Exception Raiased in "+sys._getframe().f_code.co_name +"...."+str(e))
+        raise Exception("GetRentCastAPIKeyFromSecrets --Issue "+str(e))
         
-        # Create headers combining subject property and comparable fields
-        headers = [
-            # Valuation data
-            'Estimated_Price',
-            'Price_Range_Low',
-            'Price_Range_High',
-            
-            # Subject Property fields (prefixed with Subject_)
-            'Subject_Property_ID',
-            'Subject_Formatted_Address',
-            'Subject_Address_Line_1',
-            'Subject_Address_Line_2',
-            'Subject_City',
-            'Subject_State',
-            'Subject_State_FIPS',
-            'Subject_Zip_Code',
-            'Subject_County',
-            'Subject_County_FIPS',
-            'Subject_Latitude',
-            'Subject_Longitude',
-            'Subject_Property_Type',
-            'Subject_Bedrooms',
-            'Subject_Bathrooms',
-            'Subject_Square_Footage',
-            'Subject_Lot_Size',
-            'Subject_Year_Built',
-            'Subject_Last_Sale_Date',
-            'Subject_Last_Sale_Price',
-            
-            # Comparable Property fields (prefixed with Comp_)
-            'Comp_Property_ID',
-            'Comp_Formatted_Address',
-            'Comp_Address_Line_1',
-            'Comp_Address_Line_2',
-            'Comp_City',
-            'Comp_State',
-            'Comp_State_FIPS',
-            'Comp_Zip_Code',
-            'Comp_County',
-            'Comp_County_FIPS',
-            'Comp_Latitude',
-            'Comp_Longitude',
-            'Comp_Property_Type',
-            'Comp_Bedrooms',
-            'Comp_Bathrooms',
-            'Comp_Square_Footage',
-            'Comp_Lot_Size',
-            'Comp_Year_Built',
-            'Comp_Status',
-            'Comp_Price',
-            'Comp_Listing_Type',
-            'Comp_Listed_Date',
-            'Comp_Removed_Date',
-            'Comp_Last_Seen_Date',
-            'Comp_Days_On_Market',
-            'Comp_Distance_Miles',
-            'Comp_Days_Old',
-            'Comp_Correlation'
-        ]
         
-        writer.writerow(headers)
-        
-        # Extract subject property data
-        sp = data.get('subjectProperty', {})
-        subject_data = [
-            data.get('price', ''),
-            data.get('priceRangeLow', ''),
-            data.get('priceRangeHigh', ''),
-            sp.get('id', ''),
-            sp.get('formattedAddress', ''),
-            sp.get('addressLine1', ''),
-            sp.get('addressLine2', ''),
-            sp.get('city', ''),
-            sp.get('state', ''),
-            sp.get('stateFips', ''),
-            sp.get('zipCode', ''),
-            sp.get('county', ''),
-            sp.get('countyFips', ''),
-            sp.get('latitude', ''),
-            sp.get('longitude', ''),
-            sp.get('propertyType', ''),
-            sp.get('bedrooms', ''),
-            sp.get('bathrooms', ''),
-            sp.get('squareFootage', ''),
-            sp.get('lotSize', ''),
-            sp.get('yearBuilt', ''),
-            sp.get('lastSaleDate', ''),
-            sp.get('lastSalePrice', '')
-        ]
-        
-        # Write one row for each comparable with subject property data
-        comparables = data.get('comparables', [])
-        
-        if comparables:
-            for comp in comparables:
-                row = subject_data + [
-                    comp.get('id', ''),
-                    comp.get('formattedAddress', ''),
-                    comp.get('addressLine1', ''),
-                    comp.get('addressLine2', ''),
-                    comp.get('city', ''),
-                    comp.get('state', ''),
-                    comp.get('stateFips', ''),
-                    comp.get('zipCode', ''),
-                    comp.get('county', ''),
-                    comp.get('countyFips', ''),
-                    comp.get('latitude', ''),
-                    comp.get('longitude', ''),
-                    comp.get('propertyType', ''),
-                    comp.get('bedrooms', ''),
-                    comp.get('bathrooms', ''),
-                    comp.get('squareFootage', ''),
-                    comp.get('lotSize', ''),
-                    comp.get('yearBuilt', ''),
-                    comp.get('status', ''),
-                    comp.get('price', ''),
-                    comp.get('listingType', ''),
-                    comp.get('listedDate', ''),
-                    comp.get('removedDate', ''),
-                    comp.get('lastSeenDate', ''),
-                    comp.get('daysOnMarket', ''),
-                    comp.get('distance', ''),
-                    comp.get('daysOld', ''),
-                    comp.get('correlation', '')
-                ]
-                writer.writerow(row)
-        else:
-            # If no comparables, write subject property data only
-            row = subject_data + [''] * 28  # 28 empty fields for comparable data
-            writer.writerow(row)
+# # Main execution
+# if __name__ == "__main__":
+    # # Configuration   
+    # RENTCAST_API_KEY = GetRentCastAPIKeyFromSecrets()  # Replace with your actual API key
+    # COMP_COUNT = 5  # Number of comparables
     
-    print(f"✓ CSV file created: {output_file}")
-    print(f"  Total rows: {len(comparables) if comparables else 1} (excluding header)")
-
-
-def print_summary(data):
-    """Print a summary of the fetched data"""
-    if not data:
-        return
-    
-    print("=" * 60)
-    print("DATA SUMMARY")
-    print("=" * 60)
-    
-    if 'subjectProperty' in data:
-        sp = data['subjectProperty']
-        print(f"Address: {sp.get('formattedAddress', 'N/A')}")
-        print(f"Property Type: {sp.get('propertyType', 'N/A')}")
-        print(f"Specs: {sp.get('bedrooms', 'N/A')} bed, {sp.get('bathrooms', 'N/A')} bath, {sp.get('squareFootage', 'N/A'):,} sq ft")
-        print(f"Year Built: {sp.get('yearBuilt', 'N/A')}")
-    
-    print(f"\nEstimated Price: ${data.get('price', 'N/A'):,}")
-    print(f"Price Range: ${data.get('priceRangeLow', 'N/A'):,} - ${data.get('priceRangeHigh', 'N/A'):,}")
-    
-    comp_count = len(data.get('comparables', []))
-    print(f"\nComparable Properties Found: {comp_count}")
-    print("=" * 60)
-
-
-def main():
-    """Main function to parse arguments and execute the script"""
-    parser = argparse.ArgumentParser(
-        description='Fetch RentCast property data and convert to CSV',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='''
-Examples:
-  python rentcast_to_csv.py --address "5500 Grand Lake Dr, San Antonio, TX, 78244"
-  python rentcast_to_csv.py --address "123 Main St, Austin, TX" --comp-count 10
-  python rentcast_to_csv.py --address "456 Oak Ave, Dallas, TX" --output property_data.csv
-  python rentcast_to_csv.py --api-key YOUR_KEY --address "123 Main St" (override .env API key)
-        '''
-    )
-    
-    parser.add_argument(
-        '--api-key',
-        default=None,
-        help='RentCast API key (overrides .env file if provided)'
-    )
-    
-    parser.add_argument(
-        '--address',
-        required=True,
-        help='Property address (e.g., "5500 Grand Lake Dr, San Antonio, TX, 78244")'
-    )
-    
-    parser.add_argument(
-        '--comp-count',
-        type=int,
-        default=5,
-        help='Number of comparable properties (default: 5, max: 25)'
-    )
-    
-    parser.add_argument(
-        '--output',
-        default=None,
-        help='Output CSV filename (default: rentcast_YYYYMMDD_HHMMSS.csv)'
-    )
-    
-    args = parser.parse_args()
-    
-    # Get API key from command line argument or environment variable
-    api_key = args.api_key or os.getenv('RENTCAST_API_KEY')
-    
-    if not api_key:
-        print("✗ Error: API key not found!")
-        print("  Please either:")
-        print("  1. Add RENTCAST_API_KEY to your .env file, or")
-        print("  2. Provide it via --api-key argument")
-        print("\nExample .env file:")
-        print("  RENTCAST_API_KEY=your_api_key_here")
-        exit(1)
-    
-    # Validate comp_count
-    if args.comp_count < 1 or args.comp_count > 25:
-        print("Warning: comp-count should be between 1 and 25. Using default value of 5.")
-        args.comp_count = 5
-    
-    # Generate output filename if not provided
-    if not args.output:
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        args.output = f'rentcast_avm_{timestamp}.csv'
-    
-    # Fetch data from API
-    data = fetch_rentcast_data(api_key, args.address, args.comp_count)
-    
-    if data:
-        # Print summary
-        print_summary(data)
-        
-        # Write to CSV
-        write_to_csv(data, args.output)
-        
-        print(f"\n✓ Process completed successfully!")
-        print(f"  Output file: {args.output}")
-    else:
-        print("\n✗ Failed to fetch data. Please check your API key and address.")
-        exit(1)
-
-
-if __name__ == '__main__':
-    main()
-
+    # # Initialize and run processor
+    # processor = RentCastAVMProcessor(api_key=RENTCAST_API_KEY, comp_count=COMP_COUNT)
+    # processor.process_all_addresses()
