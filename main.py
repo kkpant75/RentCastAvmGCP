@@ -16,5 +16,5 @@ def rentcast_avm_processor(request):
     # Run the address processing logic
     processor.process_all_addresses()
     
-    return "Processing completed...." +str(RENTCAST_API_KEY)
+    return "Processing completed...." +str(dict(os.environ))
  
