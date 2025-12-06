@@ -1,5 +1,5 @@
 import functions_framework
-#from RentCastAVM import *
+from RentCastAVM import *
 
 # Import your RentCastAVMProcessor and GetRentCastAPIKeyFromSecrets accordingly
 
