@@ -7,7 +7,7 @@ from RentCastAVM import *
 def rentcast_avm_processor(request):
     
     # Obtain API key from environment variables for Google Cloud Function
-    RENTCAST_API_KEY = os.getenv("RENTCAST_API_KEY") #GetRentCastAPIKeyFromSecrets()
+    RENTCAST_API_KEY = GetRentCastAPIKeyFromSecrets()
     COMP_COUNT = 5  # Number of comparables (can be parameterized)
 
     # Instantiate the processor with the API key and comp count
