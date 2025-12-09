@@ -1,7 +1,7 @@
 import functions_framework
 from RentCastAVM import *
 
-# Import your RentCastAVMProcessor and GetRentCastAPIKeyFromSecrets accordingly
+# Import your PortFileAVMProcessor and GetRentCastAPIKeyFromSecrets accordingly
 
 @functions_framework.http
 def rentcast_avm_processor(request):
@@ -11,7 +11,7 @@ def rentcast_avm_processor(request):
     COMP_COUNT = 5  # Number of comparables (can be parameterized)
 
     # Instantiate the processor with the API key and comp count
-    processor = RentCastAVMProcessor(api_key=RENTCAST_API_KEY, comp_count=COMP_COUNT)
+    processor = PortFileAVMProcessor(api_key=RENTCAST_API_KEY, comp_count=COMP_COUNT)
     
     # Run the address processing logic
     processor.process_all_addresses()

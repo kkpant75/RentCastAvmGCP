@@ -11,31 +11,55 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-class RentCastAVMProcessor:
-    def __init__(self, api_key, comp_count=5):
+class PortFileAVMProcessor:
+    def __init__(self, api_key, comp_count=5,maxRadius=5,daysOld=270):
         """
         Initialize the RentCast AVM Processor
         
         Args:
-            api_key: RentCast API key
+            api_key: RentCast API 
             comp_count: Number of comparables (default: 5)
         """
         self.api_key = api_key
         self.comp_count = comp_count
-        self.bucket_name = "rent-cast-avm"
+        self.maxRadius=maxRadius       ########### Miles
+        self.daysOld=daysOld            ######### Days
+        #self.lookupSubjectAttributes=True   ##### Boolean
+        self.bucket_name = "port-file-avm"
         self.base_folder="AVM"
-        self.input_file = F"{self.base_folder}/avmfile.txt"
-        self.processed_file = f"{self.base_folder}/processed/avmfile.txt"
+        self.input_file = F"{self.base_folder}/portfile.txt"
         self.output_folder = "JSON"
         self.log_folder = "Logs"
+        
+        #####Define Batch Size
+        self.batchSize=100
         
         # Setup logging
         self.setup_logging()
         
+        #Create Project Bucket If not exist
+        self.create_bucket()
+    
+    def create_bucket(self):
+        
+        BucketName=self.bucket_name
+        
+        storage_client = storage.Client()
+        #.from_service_account_json(os.getenv('GOOGLE_APPLICATION_KEY'))
+        bucket = storage_client.bucket(BucketName)
+
+        # Try to create the bucket
+        try:
+            if not bucket.exists():
+                bucket.create()
+                self.logger.info(f"Bucket {BucketName} created.")
+        except Exception as e:
+            self.logger.info(f"Failed to create bucket {BucketName}: {e}")
+            
     def setup_logging(self):
         """Setup logging configuration with StringIO buffer and console handlers"""
         # Create logger
-        self.logger = logging.getLogger('RentCastAVMProcessor')
+        self.logger = logging.getLogger('PortFileAVMProcessor')
         self.logger.setLevel(logging.INFO)
         
         # Clear existing handlers
@@ -67,7 +91,7 @@ class RentCastAVMProcessor:
         try:
             # Generate log filename
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            log_filename = f"rentcast_avm_{timestamp}.log"
+            log_filename = f"portfile_avm_{timestamp}.log"
             log_path = f"{self.log_folder}/{log_filename}"
             
             # Get log content from buffer
@@ -189,7 +213,7 @@ class RentCastAVMProcessor:
         """
         try:
             encoded_address = quote(address)
-            url = f"https://api.rentcast.io/v1/avm/value?address={encoded_address}&compCount={self.comp_count}"
+            url = f"https://api.rentcast.io/v1/avm/value?address={encoded_address}&compCount={self.comp_count}&maxRadius={self.maxRadius}&daysOld={self.daysOld}"
             
             headers = {
                 "X-Api-Key": self.api_key,
@@ -249,7 +273,8 @@ class RentCastAVMProcessor:
         
         self.logger.info(f"Batch complete - Success: {success_count}, Errors: {error_count}")
         return results
-    
+
+        
     def save_batch_to_gcp(self, batch_results, batch_number):
         """
         Save batch results to GCP as JSON
@@ -259,9 +284,11 @@ class RentCastAVMProcessor:
             batch_number: Batch number for file naming
         """
         try:
+            if  not self.bucket_available:
+                self.CreateBucket(self.bucket_name)
             # Generate filename with current date
             date_str = datetime.now().strftime("%y%m%d")
-            filename = f"rentcast_avm_{date_str}_{batch_number:03d}.json"
+            filename = f"portfile_avm_{date_str}_{batch_number:03d}.json"
             filepath = f"{self.output_folder}/{filename}"
             
             # Convert to JSON
@@ -288,7 +315,7 @@ class RentCastAVMProcessor:
             
             # Generate timestamped filename for processed file
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            processed_filename = f"{self.base_folder}/processed/avmfile_{timestamp}.txt"
+            processed_filename = f"{self.base_folder}/processed/portfile_{timestamp}.txt"
             
             # Get source blob
             source_blob = bucket.blob(self.input_file)
@@ -308,7 +335,7 @@ class RentCastAVMProcessor:
         """Main processing function"""
         try:
             self.logger.info("="*70)
-            self.logger.info("Starting RentCast AVM processing...")
+            self.logger.info("Starting PortFile AVM processing...")
             self.logger.info("="*70)
             
             # Cleanup old files first
@@ -323,7 +350,7 @@ class RentCastAVMProcessor:
                 return
             
             # Process in batches of 100
-            batch_size = 100
+            batch_size = self.batchSize    #100
             total_batches = (len(addresses) + batch_size - 1) // batch_size
             
             self.logger.info(f"Total addresses: {len(addresses)}")
@@ -411,14 +438,13 @@ def GetRentCastAPIKeyFromSecrets():
     except Exception as e:
         print("Exception Raiased in "+sys._getframe().f_code.co_name +"...."+str(e))
         raise Exception("GetRentCastAPIKeyFromSecrets --Issue "+str(e))
-        
-        
-# # Main execution
+            
+# Main execution
 # if __name__ == "__main__":
     # # Configuration   
     # RENTCAST_API_KEY = GetRentCastAPIKeyFromSecrets()  # Replace with your actual API key
     # COMP_COUNT = 5  # Number of comparables
     
     # # Initialize and run processor
-    # processor = RentCastAVMProcessor(api_key=RENTCAST_API_KEY, comp_count=COMP_COUNT)
+    # processor = PortFileAVMProcessor(api_key=RENTCAST_API_KEY, comp_count=COMP_COUNT)
     # processor.process_all_addresses()
