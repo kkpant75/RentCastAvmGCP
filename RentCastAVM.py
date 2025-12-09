@@ -284,8 +284,7 @@ class PortFileAVMProcessor:
             batch_number: Batch number for file naming
         """
         try:
-            if  not self.bucket_available:
-                self.CreateBucket(self.bucket_name)
+            
             # Generate filename with current date
             date_str = datetime.now().strftime("%y%m%d")
             filename = f"portfile_avm_{date_str}_{batch_number:03d}.json"
