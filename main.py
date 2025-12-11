@@ -7,13 +7,10 @@ from RentCastAVM import *
 def rentcast_avm_processor(request):
     
     # Obtain API key from environment variables for Google Cloud Function
-    RENTCAST_API_KEY = GetRentCastAPIKeyFromSecrets()
-    COMP_COUNT = 5  # Number of comparables (can be parameterized)
-
-    # Instantiate the processor with the API key and comp count
-    processor = PortFileAVMProcessor(api_key=RENTCAST_API_KEY, comp_count=COMP_COUNT)
+    RENTCAST_API_KEY = GetRentCastAPIKeyFromSecrets()  # Replace with your actual API key
     
-    # Run the address processing logic
+    # Initialize and run processor
+    processor = PortFileAVMProcessor(api_key=RENTCAST_API_KEY)
     processor.process_all_addresses()
     
     return "Processing completed...."
