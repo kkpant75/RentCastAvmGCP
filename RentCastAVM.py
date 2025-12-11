@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class PortFileAVMProcessor:
-    def __init__(self, api_key, comp_count=5,maxRadius=5,daysOld=270):
+    def __init__(self, api_key):
         """
         Initialize the RentCast AVM Processor
         
@@ -21,18 +21,18 @@ class PortFileAVMProcessor:
             comp_count: Number of comparables (default: 5)
         """
         self.api_key = api_key
-        self.comp_count = comp_count
-        self.maxRadius=maxRadius       ########### Miles
-        self.daysOld=daysOld            ######### Days
-        #self.lookupSubjectAttributes=True   ##### Boolean
+        self.comp_count = os.getenv('COMP_COUNT')
+        self.maxRadius=os.getenv('MAX_RADIUS')   ########### Miles
+        self.daysOld=os.getenv('DAYS_OLD')         ######### Days
+        self.lookupSubjectAttributes=os.getenv('LOOKUP_SUBJECT_ATTRIBUTES')   ##### Boolean
         self.bucket_name = "port-file-avm"
         self.base_folder="AVM"
-        self.input_file = F"{self.base_folder}/portfile.txt"
+        self.input_file = f"{self.base_folder}/portfolio.json"
         self.output_folder = "JSON"
         self.log_folder = "Logs"
         
         #####Define Batch Size
-        self.batchSize=100
+        self.batchSize=os.getenv('BATCH_SIZE')
         
         # Setup logging
         self.setup_logging()
@@ -80,7 +80,7 @@ class PortFileAVMProcessor:
         # StringIO buffer for log storage
         self.log_buffer = StringIO()
         buffer_handler = logging.StreamHandler(self.log_buffer)
-        buffer_handler.setLevel(logging.INFO)
+        buffer_handler.setLevel(logging.DEBUG)
         buffer_handler.setFormatter(formatter)
         self.logger.addHandler(buffer_handler)
         
@@ -91,7 +91,7 @@ class PortFileAVMProcessor:
         try:
             # Generate log filename
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            log_filename = f"portfile_avm_{timestamp}.log"
+            log_filename = f"portfolio_avm_{timestamp}.log"
             log_path = f"{self.log_folder}/{log_filename}"
             
             # Get log content from buffer
@@ -182,26 +182,29 @@ class PortFileAVMProcessor:
             self.logger.error(f"Error cleaning up old processed files: {e}")
     
     def read_addresses_from_gcp(self):
-        """Read addresses from GCP bucket"""
+        """Read addresses from a JSON file in GCP bucket"""
         try:
             self.logger.info(f"Reading addresses from {self.bucket_name}/{self.input_file}")
-            
+
             storage_client = storage.Client()
             bucket = storage_client.bucket(self.bucket_name)
             blob = bucket.blob(self.input_file)
-            
-            # Download file content
+
+            # Download full file content as text
             content = blob.download_as_text()
-            addresses = [line.strip() for line in content.split('\n') if line.strip()]
+            
+            # Parse JSON content
+            addresses = json.loads(content)
             
             self.logger.info(f"Successfully read {len(addresses)} addresses from GCP")
             return addresses
-            
+
         except Exception as e:
             self.logger.error(f"Error reading from GCP: {e}")
             return []
-    
-    def call_rentcast_api(self, address):
+
+
+    def call_rentcast_api(self, property):
         """
         Call RentCast API for a single address
         
@@ -212,14 +215,28 @@ class PortFileAVMProcessor:
             dict: API response data or error information
         """
         try:
+            #print(property)
+            address=property.get('address')
+            property_type=quote(property.get('propertyType'))
+            bedrooms=property.get('bedrooms')
+            bathrooms=property.get('bathrooms')
+            square_footage=property.get('squareFootage')
+            
+            urlComparableParameters=f"propertyType={property_type}&bedrooms={bedrooms}&bathrooms={bathrooms}"
+
+            if square_footage>0:
+                urlComparableParameters+=f"&squareFootage={square_footage}"
+            
+            clientSpecificUrlParamters=f"maxRadius={self.maxRadius}&daysOld={self.daysOld}&lookupSubjectAttributes={self.lookupSubjectAttributes}"
+            
             encoded_address = quote(address)
-            url = f"https://api.rentcast.io/v1/avm/value?address={encoded_address}&compCount={self.comp_count}&maxRadius={self.maxRadius}&daysOld={self.daysOld}"
+            url = f"https://api.rentcast.io/v1/avm/value?address={encoded_address}&compCount={self.comp_count}&{clientSpecificUrlParamters}&{urlComparableParameters}"
             
             headers = {
                 "X-Api-Key": self.api_key,
                 "Accept": "application/json"
             }
-            
+            self.logger.info(url)
             self.logger.debug(f"Calling API for address: {address}")
             response = requests.get(url, headers=headers, timeout=30)
             
@@ -247,33 +264,36 @@ class PortFileAVMProcessor:
                 "error_message": str(e)
             }
     
-    def process_batch(self, addresses):
+    def process_batch(self, properties):
         """
-        Process a batch of addresses
+        Process a batch of property JSON objects
         
         Args:
-            addresses: List of addresses to process
+            properties: List of dicts, each containing property details
             
         Returns:
-            list: Results for all addresses in the batch
+            list: Results for all properties in the batch
         """
         results = []
         success_count = 0
         error_count = 0
         
-        for idx, address in enumerate(addresses, 1):
-            self.logger.info(f"Processing address {idx}/{len(addresses)}: {address}")
-            result = self.call_rentcast_api(address)
+        for idx, property in enumerate(properties, 1):
+            #print(property)
+            self.logger.info(f"Processing property {idx}/{len(properties)}: {property.get('address')}")
+            
+            # Pass the entire property dict or unpack specific params as needed
+            result = self.call_rentcast_api(property) 
+            
             results.append(result)
             
-            if result['status'] == 'success':
+            if result.get('status') == 'success':
                 success_count += 1
             else:
                 error_count += 1
         
         self.logger.info(f"Batch complete - Success: {success_count}, Errors: {error_count}")
         return results
-
         
     def save_batch_to_gcp(self, batch_results, batch_number):
         """
@@ -287,7 +307,7 @@ class PortFileAVMProcessor:
             
             # Generate filename with current date
             date_str = datetime.now().strftime("%y%m%d")
-            filename = f"portfile_avm_{date_str}_{batch_number:03d}.json"
+            filename = f"portfolio_avm_{date_str}_{batch_number:03d}.json"
             filepath = f"{self.output_folder}/{filename}"
             
             # Convert to JSON
@@ -314,7 +334,7 @@ class PortFileAVMProcessor:
             
             # Generate timestamped filename for processed file
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            processed_filename = f"{self.base_folder}/processed/portfile_{timestamp}.txt"
+            processed_filename = f"{self.base_folder}/processed/portfolio_{timestamp}.txt"
             
             # Get source blob
             source_blob = bucket.blob(self.input_file)
@@ -334,7 +354,7 @@ class PortFileAVMProcessor:
         """Main processing function"""
         try:
             self.logger.info("="*70)
-            self.logger.info("Starting PortFile AVM processing...")
+            self.logger.info("Starting PortFolio AVM processing...")
             self.logger.info("="*70)
             
             # Cleanup old files first
@@ -349,7 +369,7 @@ class PortFileAVMProcessor:
                 return
             
             # Process in batches of 100
-            batch_size = self.batchSize    #100
+            batch_size = int(self.batchSize)   #100
             total_batches = (len(addresses) + batch_size - 1) // batch_size
             
             self.logger.info(f"Total addresses: {len(addresses)}")
@@ -442,8 +462,7 @@ def GetRentCastAPIKeyFromSecrets():
 # if __name__ == "__main__":
     # # Configuration   
     # RENTCAST_API_KEY = GetRentCastAPIKeyFromSecrets()  # Replace with your actual API key
-    # COMP_COUNT = 5  # Number of comparables
     
     # # Initialize and run processor
-    # processor = PortFileAVMProcessor(api_key=RENTCAST_API_KEY, comp_count=COMP_COUNT)
+    # processor = PortFileAVMProcessor(api_key=RENTCAST_API_KEY)
     # processor.process_all_addresses()
